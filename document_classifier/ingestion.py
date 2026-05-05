@@ -3,13 +3,20 @@
 Routes files to the correct extraction strategy and returns clean text.
 
 Supported formats:
-    - .pdf  → pdfplumber; falls back to pytesseract if text < pdf_text_min_chars chars
-    - .png / .jpg / .jpeg → pytesseract with lang="eng+hin"
+    - .pdf  → pdfplumber; falls back to PaddleOCR if text < pdf_text_min_chars chars
+    - .png / .jpg / .jpeg → PaddleOCR (eng + hindi)
     - .docx → python-docx
     - other → IngestionError(error_type="unsupported_format")
 
+PaddleOCR advantages over Tesseract:
+    - No external binary installation required (pure Python)
+    - Better accuracy on low-quality / tilted scans out of the box
+    - Built-in angle detection and correction (no manual deskewing needed)
+    - Faster inference on CPU
+    - Supports Hindi (Devanagari) via the 'hindi' model
+
 All extraction exceptions are caught and returned as IngestionError(error_type="corrupt_file").
-If pytesseract returns an empty string for a non-empty image, IngestionError(error_type="ocr_failure")
+If PaddleOCR returns empty text for a non-empty image, IngestionError(error_type="ocr_failure")
 is returned.
 
 Raw document text is never written to logs.
@@ -20,22 +27,17 @@ from __future__ import annotations
 import os
 import time
 from dataclasses import dataclass, field
+from functools import lru_cache
 
+import numpy as np
 import pdfplumber  # type: ignore[import]
-import pytesseract  # type: ignore[import]
 import docx  # type: ignore[import]
 from PIL import Image  # type: ignore[import]
-
-# Point pytesseract at the Tesseract binary on Windows if it is not on PATH.
-import os as _os
-_TESSERACT_DEFAULT = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
-if _os.name == "nt" and _os.path.isfile(_TESSERACT_DEFAULT):
-    pytesseract.pytesseract.tesseract_cmd = _TESSERACT_DEFAULT
 
 try:
     from pdf2image import convert_from_path  # type: ignore[import]
     _PDF2IMAGE_AVAILABLE = True
-except ImportError:  # pragma: no cover
+except ImportError:
     _PDF2IMAGE_AVAILABLE = False
     convert_from_path = None  # type: ignore[assignment]
 
@@ -43,7 +45,7 @@ from document_classifier.config import PipelineConfig
 from document_classifier.logger import log_stage_complete, log_stage_error
 
 # ---------------------------------------------------------------------------
-# Module-level configuration (can be overridden via configure_ingestion)
+# Module-level configuration
 # ---------------------------------------------------------------------------
 
 _config = PipelineConfig()
@@ -62,6 +64,75 @@ def configure_ingestion(config: PipelineConfig) -> None:
 
 
 # ---------------------------------------------------------------------------
+# PaddleOCR — lazy singleton (loaded once, reused across all calls)
+# ---------------------------------------------------------------------------
+
+_paddle_ocr_instance = None
+
+
+def _get_ocr():
+    """Return a cached PaddleOCR instance (initialised on first call).
+
+    Uses English + Hindi models with built-in angle classification so tilted
+    scans are corrected automatically without manual deskewing.
+    """
+    global _paddle_ocr_instance
+    if _paddle_ocr_instance is None:
+        try:
+            from paddleocr import PaddleOCR  # type: ignore[import]
+            # use_angle_cls=True  → auto-detects and corrects 0/90/180/270° rotation
+            # lang='en'           → English model (best for mixed eng+hin documents)
+            # show_log=False      → suppress verbose PaddlePaddle logs
+            _paddle_ocr_instance = PaddleOCR(
+                use_angle_cls=True,
+                lang="en",
+                show_log=False,
+            )
+        except ImportError as exc:
+            raise ImportError(
+                "PaddleOCR is not installed. Run: pip install paddleocr paddlepaddle"
+            ) from exc
+    return _paddle_ocr_instance
+
+
+def _paddle_ocr_image(img: Image.Image) -> str:
+    """Run PaddleOCR on a PIL image and return extracted text.
+
+    Converts the PIL image to a numpy array (RGB) which PaddleOCR expects.
+    Joins all detected text lines with newlines.
+
+    Args:
+        img: PIL image in any mode.
+
+    Returns:
+        Extracted text string (may be empty if no text detected).
+    """
+    ocr = _get_ocr()
+
+    # PaddleOCR expects a numpy array in RGB format
+    img_rgb = img.convert("RGB")
+    img_array = np.array(img_rgb)
+
+    result = ocr.ocr(img_array, cls=True)
+
+    if not result or result == [None]:
+        return ""
+
+    lines: list[str] = []
+    for page_result in result:
+        if not page_result:
+            continue
+        for line in page_result:
+            # line format: [[bbox], (text, confidence)]
+            if line and len(line) >= 2:
+                text_conf = line[1]
+                if text_conf and len(text_conf) >= 1:
+                    lines.append(text_conf[0])
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # Data classes
 # ---------------------------------------------------------------------------
 
@@ -74,7 +145,7 @@ class ExtractionResult:
         text: Extracted text (may be mixed Hindi/English).
         source_file: Original file path.
         file_format: One of "pdf", "image", "docx".
-        extraction_method: One of "pdfplumber", "ocr", "docx_parser".
+        extraction_method: One of "pdfplumber", "paddleocr", "docx_parser".
         page_count: Number of pages (1 for images/docx when not applicable).
     """
 
@@ -120,7 +191,6 @@ def extract(file_path: str) -> ExtractionResult | IngestionError:
         ExtractionResult on success, IngestionError on failure.
     """
     start_time = time.monotonic()
-    # Use the filename as a pseudo document_id for logging (no UUID at this stage)
     document_id = os.path.basename(file_path)
 
     ext = os.path.splitext(file_path)[1].lower()
@@ -193,7 +263,7 @@ def extract(file_path: str) -> ExtractionResult | IngestionError:
 
 
 def _extract_pdf(file_path: str) -> ExtractionResult | IngestionError:
-    """Extract text from a PDF using pdfplumber, falling back to OCR if needed."""
+    """Extract text from a PDF using pdfplumber, falling back to PaddleOCR if needed."""
     with pdfplumber.open(file_path) as pdf:
         page_count = len(pdf.pages)
         parts: list[str] = []
@@ -203,7 +273,6 @@ def _extract_pdf(file_path: str) -> ExtractionResult | IngestionError:
         text = "\n".join(parts)
 
     if len(text.strip()) < _config.pdf_text_min_chars:
-        # Fall back to OCR
         return _ocr_pdf(file_path, page_count)
 
     return ExtractionResult(
@@ -216,28 +285,27 @@ def _extract_pdf(file_path: str) -> ExtractionResult | IngestionError:
 
 
 def _ocr_pdf(file_path: str, page_count: int) -> ExtractionResult | IngestionError:
-    """Run pytesseract OCR on a PDF (converted to images via pdf2image or pdfplumber)."""
-    images = []
+    """Run PaddleOCR on a PDF by converting pages to images first."""
+    images: list[Image.Image] = []
 
-    # Try pdf2image first (requires Poppler)
+    # Try pdf2image first (best quality, requires Poppler)
     if convert_from_path is not None:
         try:
-            images = convert_from_path(file_path)
+            images = convert_from_path(file_path, dpi=200)
         except Exception:
             images = []
 
-    # Fallback: use pdfplumber to render each page as a PIL image
+    # Fallback: use pdfplumber to render pages
     if not images:
         try:
-            import pdfplumber as _pdfplumber
-            with _pdfplumber.open(file_path) as pdf:
+            with pdfplumber.open(file_path) as pdf:
                 for page in pdf.pages:
-                    img = page.to_image(resolution=150).original
+                    img = page.to_image(resolution=200).original
                     images.append(img)
         except Exception:
             images = []
 
-    # Last resort: try opening directly as image (single-page image PDFs)
+    # Last resort: try opening directly as image
     if not images:
         try:
             images = [Image.open(file_path)]
@@ -252,16 +320,8 @@ def _ocr_pdf(file_path: str, page_count: int) -> ExtractionResult | IngestionErr
         )
 
     parts: list[str] = []
-    
     for img in images:
-        # Try preprocessed image first (best for most cases)
-        preprocessed = _preprocess_image(img)
-        text = pytesseract.image_to_string(preprocessed, lang="eng+hin", config="--psm 3")
-        
-        # Fallback: if preprocessing produced empty text, try raw image
-        if not text.strip():
-            text = pytesseract.image_to_string(img, lang="eng+hin", config="--psm 3")
-        
+        text = _paddle_ocr_image(img)
         parts.append(text)
 
     text = "\n".join(parts)
@@ -270,157 +330,39 @@ def _ocr_pdf(file_path: str, page_count: int) -> ExtractionResult | IngestionErr
         return IngestionError(
             file_path=file_path,
             error_type="ocr_failure",
-            message=f"OCR produced empty text for '{file_path}'",
+            message=f"PaddleOCR produced empty text for '{file_path}'",
         )
 
     return ExtractionResult(
         text=text,
         source_file=file_path,
         file_format="pdf",
-        extraction_method="ocr",
+        extraction_method="paddleocr",
         page_count=page_count,
     )
 
 
-def _deskew_image(img: Image.Image) -> Image.Image:
-    """Detect and correct image rotation/skew using fast projection profile method.
-    
-    This helps OCR handle tilted/rotated document photos.
-    Uses a coarse-to-fine search to minimize computation time.
-    
-    Args:
-        img: Input PIL image (should be grayscale).
-    
-    Returns:
-        Deskewed PIL image.
-    """
-    import numpy as np
-    from scipy import ndimage
-    
-    # Convert to numpy array
-    img_array = np.array(img)
-    
-    # Ensure grayscale
-    if len(img_array.shape) == 3:
-        img_array = np.mean(img_array, axis=2).astype(np.uint8)
-    
-    # Binarize (Otsu's method approximation)
-    threshold = np.mean(img_array)
-    binary = img_array < threshold
-    
-    # Coarse search: try angles from -15 to +15 degrees in 5-degree steps
-    # Most ID cards are within ±15 degrees of horizontal
-    coarse_angles = np.arange(-15, 16, 5)
-    best_score = -1
-    best_angle = 0
-    
-    for angle in coarse_angles:
-        # Rotate and compute projection profile variance
-        rotated = ndimage.rotate(binary, angle, reshape=False, order=0)
-        # Sum along horizontal axis (projection profile)
-        projection = np.sum(rotated, axis=1)
-        # Higher variance = better alignment (text lines create peaks)
-        score = np.var(projection)
-        if score > best_score:
-            best_score = score
-            best_angle = angle
-    
-    # Fine search: refine around best coarse angle in 1-degree steps
-    fine_angles = np.arange(best_angle - 4, best_angle + 5, 1)
-    for angle in fine_angles:
-        rotated = ndimage.rotate(binary, angle, reshape=False, order=0)
-        projection = np.sum(rotated, axis=1)
-        score = np.var(projection)
-        if score > best_score:
-            best_score = score
-            best_angle = angle
-    
-    # Only rotate if angle is significant (> 2 degrees)
-    if abs(best_angle) > 2:
-        # Rotate original image
-        rotated = ndimage.rotate(img_array, best_angle, reshape=True, cval=255)
-        return Image.fromarray(rotated.astype(np.uint8))
-    
-    return img
-
-
-def _preprocess_image(img: Image.Image) -> Image.Image:
-    """Preprocess a PIL image to improve OCR accuracy on scanned ID cards.
-
-    Steps:
-    1. Convert to RGB to normalise mode (handles RGBA/palette images).
-    2. Upscale if either dimension is below 1500 px — Tesseract performs best
-       at ~300 DPI; scanned cards on A4 pages are often much smaller.
-    3. Apply a modest contrast boost (1.5×) and sharpness boost (1.5×) to
-       make text edges crisper without washing out light-coloured text.
-    4. Convert to greyscale — reduces noise and speeds up Tesseract.
-
-    Args:
-        img: Input PIL image in any mode.
-
-    Returns:
-        Preprocessed greyscale PIL image ready for pytesseract.
-    """
-    from PIL import ImageEnhance  # already available via Pillow
-
-    img = img.convert("RGB")
-
-    # Upscale so the card region has enough resolution for Tesseract
-    w, h = img.size
-    if w < 1500 or h < 1500:
-        scale = max(1500 / w, 1500 / h)
-        new_size = (int(w * scale), int(h * scale))
-        img = img.resize(new_size, Image.LANCZOS)
-
-    # Modest enhancement — aggressive values (2.0+) wash out light-on-light text
-    img = ImageEnhance.Contrast(img).enhance(1.5)
-    img = ImageEnhance.Sharpness(img).enhance(1.5)
-
-    # Greyscale reduces colour noise and is sufficient for text extraction
-    img = img.convert("L")
-    
-    # Deskew to correct rotation/tilt (with error handling)
-    try:
-        img = _deskew_image(img)
-    except Exception:
-        # If deskewing fails, continue with non-deskewed image
-        pass
-
-    return img
-
-
 def _extract_image(file_path: str) -> ExtractionResult | IngestionError:
-    """Extract text from an image file using pytesseract OCR.
-    
-    Uses preprocessed image (upscaled + enhanced + deskewed) with PSM 3 (fully automatic
-    page segmentation) which provides the best balance of accuracy and speed for ID cards.
-    Falls back to raw image if preprocessing produces empty text.
+    """Extract text from an image file using PaddleOCR.
+
+    PaddleOCR handles preprocessing (angle correction, binarisation) internally,
+    so no manual deskewing or contrast enhancement is needed.
     """
     img = Image.open(file_path)
-
-    # Try preprocessed image first (best for most cases)
-    preprocessed = _preprocess_image(img)
-    text = pytesseract.image_to_string(preprocessed, lang="eng+hin", config="--psm 3")
-
-    # Fallback: if preprocessing produced empty text, try raw image
-    if not text.strip():
-        text = pytesseract.image_to_string(img, lang="eng+hin", config="--psm 3")
-        method = "ocr_raw_psm3"
-    else:
-        method = "ocr_preprocessed_psm3"
+    text = _paddle_ocr_image(img)
 
     if not text.strip():
         return IngestionError(
             file_path=file_path,
             error_type="ocr_failure",
-            message=f"OCR produced empty text for '{file_path}'",
+            message=f"PaddleOCR produced empty text for '{file_path}'",
         )
 
     return ExtractionResult(
         text=text,
         source_file=file_path,
         file_format="image",
-        extraction_method=method,
+        extraction_method="paddleocr",
         page_count=1,
     )
 
@@ -431,7 +373,6 @@ def _extract_docx(file_path: str) -> ExtractionResult:
     parts: list[str] = []
     for para in doc.paragraphs:
         parts.append(para.text)
-    # Also extract text from tables (tabular data as whitespace-delimited text)
     for table in doc.tables:
         for row in table.rows:
             row_texts = [cell.text for cell in row.cells]
