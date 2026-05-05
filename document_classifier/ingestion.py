@@ -73,21 +73,23 @@ _paddle_ocr_instance = None
 def _get_ocr():
     """Return a cached PaddleOCR instance (initialised on first call).
 
-    Uses English + Hindi models with built-in angle classification so tilted
+    Uses English model with built-in text-line orientation detection so tilted
     scans are corrected automatically without manual deskewing.
+    Compatible with PaddleOCR >= 3.x API.
     """
     global _paddle_ocr_instance
     if _paddle_ocr_instance is None:
         try:
             from paddleocr import PaddleOCR  # type: ignore[import]
-            # use_angle_cls=True  → auto-detects and corrects 0/90/180/270° rotation
-            # lang='en'           → English model (best for mixed eng+hin documents)
-            # show_log=False      → suppress verbose PaddlePaddle logs
-            _paddle_ocr_instance = PaddleOCR(
-                use_angle_cls=True,
-                lang="en",
-                show_log=False,
-            )
+            import warnings
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                # use_textline_orientation=True → auto-detects and corrects rotation
+                # lang='en' → English model (handles mixed eng+hin documents)
+                _paddle_ocr_instance = PaddleOCR(
+                    use_textline_orientation=True,
+                    lang="en",
+                )
         except ImportError as exc:
             raise ImportError(
                 "PaddleOCR is not installed. Run: pip install paddleocr paddlepaddle"

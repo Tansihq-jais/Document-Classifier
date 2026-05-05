@@ -81,7 +81,7 @@ def _is_error(result) -> bool:
 with st.sidebar:
     st.title("📄 Document Classifier")
     st.divider()
-    db_path = st.text_input("ChromaDB directory", value="./chroma_db")
+    db_path = st.text_input("ChromaDB directory", value="./chroma_db_paddle")
     pipeline = _get_pipeline(db_path)
     st.caption(f"Supported: {', '.join(SUPPORTED_FORMATS)}")
     st.divider()

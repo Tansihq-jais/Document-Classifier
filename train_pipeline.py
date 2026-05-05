@@ -32,7 +32,7 @@ from document_classifier.pipeline import Pipeline
 # ---------------------------------------------------------------------------
 
 DEFAULT_DATA_DIR = Path("training_data")
-DEFAULT_DB_DIR = "./chroma_db"
+DEFAULT_DB_DIR = "./chroma_db_paddle"
 
 # Map subdirectory name → human-readable label
 LABEL_MAP: dict[str, str] = {

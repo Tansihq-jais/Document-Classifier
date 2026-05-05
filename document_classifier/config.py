@@ -19,7 +19,7 @@ class PipelineConfig:
         log_file_path:           Log file path (used when log_output is "file" or "both").
     """
 
-    chroma_persist_dir: str = "./chroma_db"
+    chroma_persist_dir: str = "./chroma_db_paddle"
     embedding_model_name: str = "intfloat/multilingual-e5-large"
     hdbscan_min_cluster_size: int = 5
     hdbscan_min_samples: int = 2
