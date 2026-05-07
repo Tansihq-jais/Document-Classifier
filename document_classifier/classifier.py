@@ -57,9 +57,9 @@ CLASSIFICATION_RULES = [
             ["Unique Identification Authority of India"],
             ["UIDAI"],
             ["आधार", "Government of India"],
-            ["Your Aadhaar No"],  # Physical card marker
-            ["आधार", "आम आदमी का अधिकार"],  # Hindi slogan
-            ["मेरा आधार", "मेरी पहचान"],  # Another Hindi slogan
+            ["Your Aadhaar No"],
+            ["आधार", "आम आदमी का अधिकार"],
+            ["मेरा आधार", "मेरी पहचान"],
         ],
         "fuzzy_threshold": 0.85,
     },
@@ -78,9 +78,70 @@ CLASSIFICATION_RULES = [
             ["Republic of India", "Passport"],
             ["भारत गणराज्य", "Passport"],
             ["REPUBLIC OF INDIA", "Passport"],
-            ["Passport", "INDIAN"],  # Fallback for garbled OCR
-            ["Passport", "IND"],  # MRZ code pattern
-            ["P<IND"],  # Machine Readable Zone (MRZ) pattern
+            ["Passport", "INDIAN"],
+            ["Passport", "IND"],
+            ["P<IND"],
+        ],
+        "fuzzy_threshold": 0.85,
+    },
+    {
+        "label": "Purchase Order",
+        "keyword_sets": [
+            # Strong PO-specific combinations — must NOT match invoices
+            ["PURCHASE ORDER", "VENDOR", "SHIP TO"],
+            ["PURCHASE ORDER", "QTY. ORDERED", "UNIT PRICE"],
+            ["PURCHASE ORDER", "DOCK DATE"],
+            ["PURCHASE ORDER", "LINE/REL"],
+            ["Purchase Order", "Vendor", "Ship To", "Unit Price"],
+            ["Purchase Order", "PO Number", "Ship Via"],
+            ["Purchase Order", "Delivery date", "PO number"],
+            ["PO Number", "Ship To", "Qty", "Unit Price"],
+            ["PLEASE ACCEPT OUR ORDER", "PURCHASE ORDER"],
+            ["purchase order", "vendor", "qty. ordered"],
+        ],
+        "fuzzy_threshold": 0.85,
+    },
+    {
+        "label": "Invoice / Receipt",
+        "keyword_sets": [
+            # Invoice-specific — must NOT match POs
+            ["INVOICE", "Bill To", "Amount Due"],
+            ["Invoice", "Bill To", "Total Due"],
+            ["TAX INVOICE", "GSTIN"],
+            ["Invoice Number", "Invoice Date", "Amount Due"],
+            ["Invoice", "Payment Due", "Subtotal"],
+            ["INVOICE NO", "BILL TO", "TOTAL"],
+            ["Receipt", "Amount Paid", "Transaction"],
+            ["Invoice", "Due Date", "Balance Due"],
+            ["invoice", "bill to", "total amount"],
+        ],
+        "fuzzy_threshold": 0.85,
+    },
+    {
+        "label": "Shipping Order",
+        "keyword_sets": [
+            ["Ship Name", "Ship Address", "Ship City"],
+            ["Shipper", "Consignee", "Bill of Lading"],
+            ["BILL OF LADING", "SHIPPER", "CONSIGNEE"],
+            ["Shipping Order", "Ship To", "Tracking"],
+            ["AWB", "Shipper", "Consignee"],
+            ["Waybill", "Shipper", "Consignee"],
+            ["Ship Name", "Shipper", "Ship Country"],
+            ["Shipping Details", "Ship Name", "Ship Address"],
+            ["Order ID", "Shipping Details", "Shipper"],
+        ],
+        "fuzzy_threshold": 0.85,
+    },
+    {
+        "label": "Inventory Report",
+        "keyword_sets": [
+            ["Stock Report", "Units in Stock", "Units Sold"],
+            ["Inventory", "Units in Stock", "Reorder Level"],
+            ["Stock Report", "Category", "Unit Price"],
+            ["Inventory Report", "Product", "Quantity"],
+            ["Units in Stock", "Units Sold", "Unit Price"],
+            ["Stock", "Product", "Units in Stock", "Category"],
+            ["inventory", "stock", "units sold"],
         ],
         "fuzzy_threshold": 0.85,
     },
@@ -216,7 +277,7 @@ def classify(
     document_id = os.path.basename(file_path)
 
     # Step 1: Extract text
-    extraction = ingestion_module.extract(file_path)
+    extraction = ingestion_module.extract_for_classification(file_path)
     if isinstance(extraction, IngestionError):
         return ClassificationError(
             error_type="embedding_failed",

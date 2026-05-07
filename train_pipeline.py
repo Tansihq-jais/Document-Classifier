@@ -1,19 +1,33 @@
-"""Train the document classifier pipeline on a corpus of labelled documents.
+"""Supervised training pipeline for the document classifier.
 
-Walks the training_data/ directory, ingests all supported documents into the
-vector store, triggers clustering, and auto-labels clusters based on the
-subdirectory name (which acts as the ground-truth label).
+Ingests all 7 document types with CORRECT labels assigned directly at ingest
+time — no unsupervised clustering, no majority-vote guessing.
 
-Directory structure expected:
+Each document type gets a fixed cluster_id so the classifier's centroid lookup
+works correctly:
+
+    0  → Aadhaar Card
+    1  → PAN Card
+    2  → Indian Passport
+    3  → Invoice / Receipt
+    4  → Purchase Order
+    5  → Inventory Report
+    6  → Shipping Order
+
+Directory structure expected (200 files each):
     training_data/
-    ├── aadhaar/        → label: "Aadhaar Card"
-    ├── pan_card/       → label: "PAN Card"
-    ├── passport/       → label: "Indian Passport"
-    └── other/          → label: "Other"
+    ├── aadhaar/           → label: "Aadhaar Card"
+    ├── pan_card/          → label: "PAN Card"
+    ├── passport/          → label: "Indian Passport"
+    ├── invoices_receipts/ → label: "Invoice / Receipt"
+    ├── purchase_order/    → label: "Purchase Order"
+    ├── inventory_report/  → label: "Inventory Report"
+    └── shipping_order/    → label: "Shipping Order"
 
 Usage:
     python train_pipeline.py
-    python train_pipeline.py --data-dir path/to/data --db-dir path/to/chroma_db
+    python train_pipeline.py --data-dir path/to/data --db-dir ./chroma_db --max 200
+    python train_pipeline.py --no-confirm   # skip the Y/n prompt
 """
 
 from __future__ import annotations
@@ -21,11 +35,16 @@ from __future__ import annotations
 import argparse
 import sys
 import time
+import uuid
+from collections import Counter
+from datetime import datetime, timezone
 from pathlib import Path
 
 from document_classifier.config import PipelineConfig
 from document_classifier.ingestion import IngestionError, SUPPORTED_FORMATS
-from document_classifier.pipeline import Pipeline
+from document_classifier.vector_store import DocumentRecord, VectorStore
+from document_classifier import embedding as embedding_module
+from document_classifier import ingestion as ingestion_module
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -33,79 +52,137 @@ from document_classifier.pipeline import Pipeline
 
 DEFAULT_DATA_DIR = Path("training_data")
 DEFAULT_DB_DIR = "./chroma_db"
+DEFAULT_MAX_PER_TYPE = 200
 
-# Map subdirectory name → human-readable label
-LABEL_MAP: dict[str, str] = {
-    "aadhaar": "Aadhaar Card",
-    "pan_card": "PAN Card",
-    "pan": "PAN Card",
-    "passport": "Indian Passport",
-    "other": "Other",
+# Map subdirectory name → (human-readable label, fixed cluster_id)
+# cluster_id is fixed per type so centroid lookup is deterministic.
+LABEL_MAP: dict[str, tuple[str, int]] = {
+    "aadhaar":           ("Aadhaar Card",      0),
+    "pan_card":          ("PAN Card",           1),
+    "pan":               ("PAN Card",           1),
+    "passport":          ("Indian Passport",    2),
+    "invoices_receipts": ("Invoice / Receipt",  3),
+    "purchase_order":    ("Purchase Order",     4),
+    "inventory_report":  ("Inventory Report",   5),
+    "shipping_order":    ("Shipping Order",     6),
 }
 
 SUPPORTED_EXTS = {ext.lstrip(".") for ext in SUPPORTED_FORMATS}
-
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 
-def _collect_files(data_dir: Path) -> list[tuple[Path, str]]:
-    """Collect all supported files with their labels from data_dir.
-
-    Args:
-        data_dir: Root training data directory with labelled subdirectories.
+def _collect_files(
+    data_dir: Path, max_per_type: int
+) -> list[tuple[Path, str, int]]:
+    """Collect up to max_per_type supported files per labelled subdirectory.
 
     Returns:
-        List of (file_path, label) tuples.
+        List of (file_path, label, cluster_id) tuples.
     """
-    files: list[tuple[Path, str]] = []
+    files: list[tuple[Path, str, int]] = []
 
     if not data_dir.exists():
         print(f"❌ Training data directory not found: {data_dir}")
-        print()
-        print("Run first: python download_datasets.py")
-        print("Or create the directory and add documents manually:")
-        print(f"  {data_dir}/aadhaar/   → Aadhaar card images/PDFs")
-        print(f"  {data_dir}/pan_card/  → PAN card images/PDFs")
-        print(f"  {data_dir}/passport/  → Passport images/PDFs")
-        print(f"  {data_dir}/other/     → Other documents")
         return files
+
+    skipped_dirs: list[str] = []
 
     for subdir in sorted(data_dir.iterdir()):
         if not subdir.is_dir() or subdir.name.startswith("_"):
             continue
 
-        label = LABEL_MAP.get(subdir.name.lower(), subdir.name.replace("_", " ").title())
+        key = subdir.name.lower()
+        if key not in LABEL_MAP:
+            skipped_dirs.append(subdir.name)
+            continue
 
-        subdir_files = [
+        label, cluster_id = LABEL_MAP[key]
+
+        subdir_files = sorted(
             f for f in subdir.iterdir()
             if f.is_file() and f.suffix.lower().lstrip(".") in SUPPORTED_EXTS
-        ]
+        )
 
-        if not subdir_files:
+        selected = subdir_files[:max_per_type]
+
+        if not selected:
             print(f"⚠️  No supported files in: {subdir.name}/")
             continue
 
-        for f in sorted(subdir_files):
-            files.append((f, label))
+        for f in selected:
+            files.append((f, label, cluster_id))
+
+    if skipped_dirs:
+        print(f"ℹ️  Skipped unknown subdirs: {', '.join(skipped_dirs)}")
 
     return files
 
 
-def _print_plan(files: list[tuple[Path, str]]) -> None:
+def _print_plan(files: list[tuple[Path, str, int]]) -> None:
     """Print a summary of what will be ingested."""
-    from collections import Counter
-    label_counts = Counter(label for _, label in files)
+    label_counts: Counter = Counter(label for _, label, _ in files)
 
-    print("📋 Training Plan:")
-    print("-" * 40)
+    print("📋 Training Plan (supervised — labels assigned directly):")
+    print("-" * 55)
     for label, count in sorted(label_counts.items()):
-        print(f"  {label:<25}: {count} files")
-    print("-" * 40)
-    print(f"  {'TOTAL':<25}: {len(files)} files")
+        print(f"  {label:<25}: {count:>4} files")
+    print("-" * 55)
+    print(f"  {'TOTAL':<25}: {len(files):>4} files")
     print()
+
+
+def _now_iso() -> str:
+    return (
+        datetime.now(tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Core supervised ingest
+# ---------------------------------------------------------------------------
+
+
+def _ingest_supervised(
+    file_path: Path,
+    label: str,
+    cluster_id: int,
+    vector_store: VectorStore,
+) -> bool:
+    """Extract, embed, and store a document with a pre-assigned label.
+
+    Returns True on success, False on failure.
+    """
+    # 1. Extract text
+    extraction = ingestion_module.extract(str(file_path))
+    if isinstance(extraction, IngestionError):
+        return False
+
+    # 2. Embed
+    doc_id = str(uuid.uuid4())
+    try:
+        embedding_result = embedding_module.embed(extraction.text, doc_id)
+    except Exception:
+        return False
+
+    # 3. Build record with label + cluster_id already set
+    record = DocumentRecord(
+        id=doc_id,
+        text=extraction.text,
+        vector=embedding_result.vector,
+        source_filename=extraction.source_file,
+        file_format=extraction.file_format,
+        ingestion_timestamp=_now_iso(),
+        cluster_id=cluster_id,
+        label=label,
+        corrected_label=None,
+    )
+
+    # 4. Persist
+    vector_store.add(record)
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -113,133 +190,101 @@ def _print_plan(files: list[tuple[Path, str]]) -> None:
 # ---------------------------------------------------------------------------
 
 
-def train(data_dir: Path, db_dir: str) -> None:
-    print("=" * 55)
-    print("Document Classifier — Training Pipeline")
-    print("=" * 55)
+def train(data_dir: Path, db_dir: str, max_per_type: int, no_confirm: bool) -> None:
+    print("=" * 60)
+    print("Document Classifier — Supervised Training Pipeline")
+    print("=" * 60)
     print()
 
     # Step 1: Collect files
-    files = _collect_files(data_dir)
+    files = _collect_files(data_dir, max_per_type)
     if not files:
+        print("❌ No files found. Check your training_data/ directory.")
         sys.exit(1)
 
     _print_plan(files)
 
-    # Confirm before starting
-    answer = input(f"Start ingesting {len(files)} documents? [Y/n]: ").strip().lower()
-    if answer == "n":
-        print("Aborted.")
-        return
-    print()
+    # Warn if any type is missing
+    present_labels = {label for _, label, _ in files}
+    all_labels = {v[0] for v in LABEL_MAP.values()}
+    missing = all_labels - present_labels
+    if missing:
+        print(f"⚠️  Missing document types: {', '.join(sorted(missing))}")
+        print()
 
-    # Step 2: Initialise pipeline
+    # Confirm
+    if not no_confirm:
+        answer = input(
+            f"Start ingesting {len(files)} documents into '{db_dir}'? [Y/n]: "
+        ).strip().lower()
+        if answer == "n":
+            print("Aborted.")
+            return
+        print()
+
+    # Step 2: Initialise vector store directly (no pipeline / no clustering)
     config = PipelineConfig(
         chroma_persist_dir=db_dir,
         log_output="file",
-        hdbscan_min_cluster_size=3,
-        hdbscan_min_samples=1,
-        recluster_threshold=10,  # Cluster more frequently during training
     )
-    pipeline = Pipeline(config=config)
+    vector_store = VectorStore(config)
 
-    # Step 3: Ingest all documents
-    print("📥 Ingesting documents...")
-    print("-" * 55)
+    # Step 3: Ingest all documents with correct labels
+    print("📥 Ingesting documents with supervised labels...")
+    print("-" * 60)
 
     ok_count = 0
     fail_count = 0
     start_time = time.monotonic()
+    current_label: str | None = None
 
-    # Group files by label for organised output
-    current_label = None
-
-    for i, (file_path, label) in enumerate(files, 1):
+    for i, (file_path, label, cluster_id) in enumerate(files, 1):
         if label != current_label:
             current_label = label
-            print(f"\n  [{label}]")
+            print(f"\n  [{label}]  (cluster_id={cluster_id})")
 
-        result = pipeline.ingest(str(file_path))
+        success = _ingest_supervised(file_path, label, cluster_id, vector_store)
 
-        if isinstance(result, IngestionError):
-            print(f"  ❌ [{i:3}/{len(files)}] {file_path.name} — {result.error_type}: {result.message}")
-            fail_count += 1
-        else:
+        if success:
             print(f"  ✅ [{i:3}/{len(files)}] {file_path.name}")
             ok_count += 1
+        else:
+            print(f"  ❌ [{i:3}/{len(files)}] {file_path.name}  — ingestion/embedding failed")
+            fail_count += 1
 
     elapsed = time.monotonic() - start_time
+
+    # Step 4: Summary
     print()
-    print("-" * 55)
-    print(f"Ingestion complete in {elapsed:.1f}s")
-    print(f"  ✅ Success : {ok_count}")
-    print(f"  ❌ Failed  : {fail_count}")
+    print("=" * 60)
+    print("✅ Supervised Training Complete!")
+    print("=" * 60)
+    print(f"  Documents ingested : {ok_count}")
+    print(f"  Documents failed   : {fail_count}")
+    print(f"  Total time         : {elapsed:.1f}s")
+    print()
+
+    # Per-label breakdown
+    label_ok: Counter = Counter()
+    label_fail: Counter = Counter()
+    for file_path, label, _ in files:
+        # We don't track per-file success here, but show totals
+        pass
+
+    print("  Label assignments (cluster_id → label):")
+    for key, (lbl, cid) in sorted(LABEL_MAP.items(), key=lambda x: x[1][1]):
+        print(f"    {cid}  →  {lbl}")
     print()
 
     if ok_count == 0:
-        print("❌ No documents were ingested successfully. Cannot train.")
+        print("❌ No documents were ingested. Cannot classify.")
         sys.exit(1)
 
-    # Step 4: Force final clustering
-    print("🔄 Running final clustering...")
-    pipeline._vector_store.reset_new_doc_counter()
-    # Force recluster by temporarily lowering threshold
-    pipeline._config.recluster_threshold = 1
-    pipeline._maybe_trigger_recluster()
-    pipeline._config.recluster_threshold = config.recluster_threshold
-
-    clusters = pipeline.list_clusters()
-    print(f"   Found {len(clusters)} cluster(s)")
-    print()
-
-    if not clusters:
-        print("⚠️  No clusters formed. Try ingesting more documents.")
-        return
-
-    # Step 5: Auto-label clusters based on majority document label
-    print("🏷️  Auto-labelling clusters...")
-    print("-" * 55)
-
-    # Build a map of document_id → ground truth label
-    doc_label_map: dict[str, str] = {}
-    for file_path, label in files:
-        # Match by source filename
-        doc_label_map[file_path.name] = label
-
-    labelled = 0
-    for cluster_id in clusters:
-        members = pipeline._vector_store.get_cluster_members(cluster_id)
-        if not members:
-            continue
-
-        # Count labels among members
-        from collections import Counter
-        label_votes: Counter = Counter()
-        for member in members:
-            src = Path(member.source_filename).name if member.source_filename else ""
-            gt_label = doc_label_map.get(src)
-            if gt_label:
-                label_votes[gt_label] += 1
-
-        if label_votes:
-            best_label, votes = label_votes.most_common(1)[0]
-            pipeline.label_cluster(cluster_id, best_label)
-            print(f"  Cluster {cluster_id:2d} → '{best_label}' ({votes}/{len(members)} votes)")
-            labelled += 1
-        else:
-            print(f"  Cluster {cluster_id:2d} → ⚠️  Could not determine label ({len(members)} members)")
-
-    print()
-    print("=" * 55)
-    print("✅ Training Complete!")
-    print("=" * 55)
-    print(f"  Clusters formed  : {len(clusters)}")
-    print(f"  Clusters labelled: {labelled}")
-    print(f"  Documents ingested: {ok_count}")
-    print(f"  Total time       : {elapsed:.1f}s")
-    print()
     print("Run the UI to start classifying:")
     print("  python -m streamlit run document_classifier/app.py")
+    print()
+    print("Or classify from CLI:")
+    print("  python -m document_classifier classify your_document.pdf")
 
 
 # ---------------------------------------------------------------------------
@@ -249,7 +294,7 @@ def train(data_dir: Path, db_dir: str) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Train the document classifier pipeline."
+        description="Supervised training for the document classifier."
     )
     parser.add_argument(
         "--data-dir",
@@ -263,9 +308,26 @@ def main() -> None:
         default=DEFAULT_DB_DIR,
         help=f"ChromaDB directory (default: {DEFAULT_DB_DIR})",
     )
+    parser.add_argument(
+        "--max",
+        type=int,
+        default=DEFAULT_MAX_PER_TYPE,
+        dest="max_per_type",
+        help=f"Max files per document type (default: {DEFAULT_MAX_PER_TYPE})",
+    )
+    parser.add_argument(
+        "--no-confirm",
+        action="store_true",
+        help="Skip the Y/n confirmation prompt",
+    )
     args = parser.parse_args()
 
-    train(data_dir=args.data_dir, db_dir=args.db_dir)
+    train(
+        data_dir=args.data_dir,
+        db_dir=args.db_dir,
+        max_per_type=args.max_per_type,
+        no_confirm=args.no_confirm,
+    )
 
 
 if __name__ == "__main__":

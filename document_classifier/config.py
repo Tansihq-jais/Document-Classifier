@@ -17,6 +17,8 @@ class PipelineConfig:
         pdf_text_min_chars:      Min chars from pdfplumber before falling back to OCR.
         log_output:              Log destination: "stdout" | "file" | "both".
         log_file_path:           Log file path (used when log_output is "file" or "both").
+        extraction_api_url:      Remote text extraction API endpoint. Set to "" to disable.
+        extraction_api_timeout:  Timeout in seconds for the extraction API call.
     """
 
     chroma_persist_dir: str = "./chroma_db"
@@ -28,3 +30,5 @@ class PipelineConfig:
     pdf_text_min_chars: int = 50
     log_output: str = "stdout"
     log_file_path: str = "./pipeline.log"
+    extraction_api_url: str = "https://staging-api.gipdataboard.io/api/extract_text_from_stream"
+    extraction_api_timeout: int = 30

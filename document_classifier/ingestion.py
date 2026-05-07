@@ -12,6 +12,10 @@ All extraction exceptions are caught and returned as IngestionError(error_type="
 If pytesseract returns an empty string for a non-empty image, IngestionError(error_type="ocr_failure")
 is returned.
 
+For classification, use extract_for_classification() which calls the remote API
+(staging-api.gipdataboard.io) for PDFs and images, falling back to local extraction
+if the API is unavailable or disabled.
+
 Raw document text is never written to logs.
 """
 
@@ -185,6 +189,139 @@ def extract(file_path: str) -> ExtractionResult | IngestionError:
         },
     )
     return result
+
+
+# ---------------------------------------------------------------------------
+# Internal extraction helpers
+# ---------------------------------------------------------------------------
+
+
+def _call_extraction_api(
+    file_path: str,
+    ext: str,
+) -> str | None:
+    """Call the remote extraction API and return text, or None on failure.
+
+    - PDFs  → multipart/form-data  (API expects a file field)
+    - Images → raw binary body     (API expects application/octet-stream)
+    - Other formats are not sent to the API.
+
+    Args:
+        file_path: Path to the file to extract text from.
+        ext: Lowercase file extension including dot (e.g. ".pdf", ".jpg").
+
+    Returns:
+        Extracted text string on success, None if the API is disabled,
+        unreachable, or returns an error.
+    """
+    api_url = _config.extraction_api_url
+    if not api_url:
+        return None
+
+    try:
+        import requests  # type: ignore[import]
+
+        timeout = _config.extraction_api_timeout
+
+        with open(file_path, "rb") as f:
+            file_bytes = f.read()
+
+        if ext == ".pdf":
+            # PDFs: multipart/form-data with field name "file"
+            response = requests.post(
+                api_url,
+                files={"file": (os.path.basename(file_path), file_bytes, "application/pdf")},
+                timeout=timeout,
+            )
+        elif ext in (".jpg", ".jpeg", ".png", ".docx"):
+            # Images and DOCX: raw binary body
+            response = requests.post(
+                api_url,
+                data=file_bytes,
+                headers={"Content-Type": "application/octet-stream"},
+                timeout=timeout,
+            )
+        else:
+            return None
+
+        if response.status_code == 200:
+            data = response.json()
+            if data.get("success") and data.get("text", "").strip():
+                return data["text"]
+
+    except Exception:  # noqa: BLE001
+        # Network error, timeout, JSON parse error — fall through to local
+        pass
+
+    return None
+
+
+def extract_for_classification(file_path: str) -> "ExtractionResult | IngestionError":
+    """Extract text for classification using the remote API when available.
+
+    For PDFs and images, tries the remote extraction API first.
+    Falls back to local extraction (pdfplumber / pytesseract) if:
+      - The API URL is not configured
+      - The API call fails or times out
+      - The API returns empty text
+
+    .docx files always use local extraction (python-docx).
+
+    Args:
+        file_path: Absolute or relative path to the document file.
+
+    Returns:
+        ExtractionResult on success, IngestionError on failure.
+    """
+    start_time = time.monotonic()
+    document_id = os.path.basename(file_path)
+    ext = os.path.splitext(file_path)[1].lower()
+
+    if ext not in SUPPORTED_FORMATS:
+        error = IngestionError(
+            file_path=file_path,
+            error_type="unsupported_format",
+            message=(
+                f"Unsupported file format '{ext}'. "
+                f"Supported formats: {', '.join(SUPPORTED_FORMATS)}"
+            ),
+            supported_formats=list(SUPPORTED_FORMATS),
+        )
+        log_stage_error(
+            stage="ingestion",
+            document_id=document_id,
+            error_type=error.error_type,
+            message=error.message,
+        )
+        return error
+
+    # --- Try remote API for PDFs, images and DOCX ---
+    if ext in (".pdf", ".jpg", ".jpeg", ".png", ".docx"):
+        api_text = _call_extraction_api(file_path, ext)
+        if api_text:
+            file_format = "pdf" if ext == ".pdf" else ("docx" if ext == ".docx" else "image")
+            duration_ms = (time.monotonic() - start_time) * 1000.0
+            result = ExtractionResult(
+                text=api_text,
+                source_file=file_path,
+                file_format=file_format,
+                extraction_method="api",
+                page_count=1,
+            )
+            log_stage_complete(
+                stage="ingestion",
+                document_id=document_id,
+                duration_ms=duration_ms,
+                metadata={
+                    "file_format": file_format,
+                    "extraction_method": "api",
+                    "page_count": 1,
+                },
+            )
+            return result
+
+    # --- Fallback to local extraction ---
+    return extract(file_path)
 
 
 # ---------------------------------------------------------------------------
