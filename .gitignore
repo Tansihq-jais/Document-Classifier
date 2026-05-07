@@ -23,6 +23,7 @@ chroma_db/
 training_data/
 pipeline.log
 *.log
+.env
 
 # OS
 .DS_Store

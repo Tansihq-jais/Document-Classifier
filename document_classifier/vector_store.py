@@ -124,19 +124,36 @@ def _record_from_chroma(
 
 
 class VectorStore:
-    """Wraps a ChromaDB PersistentClient to store and query document embeddings.
+    """Wraps a ChromaDB client to store and query document embeddings.
+
+    Uses ChromaDB Cloud if chroma_api_key/tenant/database are set in config,
+    otherwise falls back to local PersistentClient.
 
     Args:
-        config: PipelineConfig instance providing chroma_persist_dir.
+        config: PipelineConfig instance.
     """
 
     def __init__(self, config: "PipelineConfig") -> None:
         import chromadb
+        import os
 
-        if config.chroma_persist_dir == ":memory:":
+        # Resolve credentials — config fields take priority, then env vars
+        api_key  = config.chroma_api_key  or os.environ.get("CHROMA_API_KEY", "")
+        tenant   = config.chroma_tenant   or os.environ.get("CHROMA_TENANT", "")
+        database = config.chroma_database or os.environ.get("CHROMA_DATABASE", "")
+
+        if api_key and tenant and database:
+            # Chroma Cloud
+            self._client = chromadb.CloudClient(
+                api_key=api_key,
+                tenant=tenant,
+                database=database,
+            )
+        elif config.chroma_persist_dir == ":memory:":
             self._client = chromadb.EphemeralClient()
         else:
             self._client = chromadb.PersistentClient(path=config.chroma_persist_dir)
+
         self._collection = self._client.get_or_create_collection(
             name="documents",
             metadata={"hnsw:space": "cosine"},

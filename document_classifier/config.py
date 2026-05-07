@@ -32,3 +32,7 @@ class PipelineConfig:
     log_file_path: str = "./pipeline.log"
     extraction_api_url: str = "https://staging-api.gipdataboard.io/api/extract_text_from_stream"
     extraction_api_timeout: int = 30
+    # Chroma Cloud settings — leave empty to use local PersistentClient
+    chroma_api_key: str = ""
+    chroma_tenant: str = ""
+    chroma_database: str = ""

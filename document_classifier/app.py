@@ -50,11 +50,17 @@ _SUPPORTED_EXTS = [e.lstrip(".") for e in SUPPORTED_FORMATS]
 
 @st.cache_resource
 def _get_pipeline(db_path: str) -> Pipeline:
+    import os
+    from dotenv import load_dotenv
+    load_dotenv()
     config = PipelineConfig(
         chroma_persist_dir=db_path,
         log_output="file",
         hdbscan_min_cluster_size=5,
         hdbscan_min_samples=2,
+        chroma_api_key=os.environ.get("CHROMA_API_KEY", ""),
+        chroma_tenant=os.environ.get("CHROMA_TENANT", ""),
+        chroma_database=os.environ.get("CHROMA_DATABASE", ""),
     )
     return Pipeline(config=config)
 
