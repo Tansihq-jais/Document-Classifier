@@ -61,6 +61,8 @@ def _get_pipeline(db_path: str) -> Pipeline:
         chroma_api_key=os.environ.get("CHROMA_API_KEY", ""),
         chroma_tenant=os.environ.get("CHROMA_TENANT", ""),
         chroma_database=os.environ.get("CHROMA_DATABASE", ""),
+        extraction_api_url=os.environ.get("EXTRACTION_API_URL", ""),
+        extraction_api_timeout=int(os.environ.get("EXTRACTION_API_TIMEOUT", "30")),
     )
     return Pipeline(config=config)
 
